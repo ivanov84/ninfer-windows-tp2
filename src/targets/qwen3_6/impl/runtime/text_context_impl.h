@@ -2594,6 +2594,52 @@ void TextContext::mtp_forward_core_tp2(const Tensor& ids, const std::array<Tenso
     mtp_forward_tail_tp2(x, ah, positions, rope_positions, envelope, mtp_hidden, staging);
 }
 
+void TextContext::mtp_forward_batch_tp2(const Tensor& token,
+                                        const std::array<Tensor, 2>& previous_hidden,
+                                        const std::array<Tensor, 2>& position,
+                                        const std::array<std::int32_t, 3>& rope_position,
+                                        ops::GqaExecutionEnvelope envelope,
+                                        const std::array<Tensor, 2>& mtp_hidden,
+                                        int logits_column, std::array<Tensor, 2>* logits,
+                                        Tensor* draft_token) {
+    if (!tp2()) { throw std::logic_error("tensor-parallel MTP batch forward requires a peer"); }
+    if (batch_mtp_kv_ == nullptr || tp_->batch_mtp_kv == nullptr) {
+        throw std::runtime_error("MTP forward is not enabled");
+    }
+    require_tensor_shape(token, DType::I32, {1}, "MTP batch token");
+    for (std::size_t r = 0; r < 2; ++r) {
+        require_tensor_shape(position[r], DType::I32, {1}, "MTP batch position");
+        require_tensor_shape(previous_hidden[r], DType::BF16, {kCfg.hidden, 1},
+                             "MTP batch previous hidden");
+        require_tensor_shape(mtp_hidden[r], DType::BF16, {kCfg.hidden, 1}, "MTP batch hidden");
+        if (logits_column >= 0) {
+            require_tensor_shape(logits->at(r), DType::BF16, {kCfg.vocab, 1}, "MTP batch logits");
+        }
+    }
+    if (logits_column >= 0 && (logits == nullptr || draft_token == nullptr)) {
+        throw std::invalid_argument("MTP batch logits and draft_token outputs are required");
+    }
+    if (logits_column >= 0) {
+        require_tensor_shape(*draft_token, DType::I32, {1}, "MTP batch draft token");
+    }
+    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    auto scope_0                            = work_.scope();
+    auto scope_1                            = tp_->work->scope();
+    std::array<Tensor, 2> rope_positions;
+    for (std::size_t r = 0; r < 2; ++r) {
+        rope_positions[r] = ws[r]->alloc(DType::I32, {1, 3});
+        CUDA_CHECK(cudaMemcpyAsync(rope_positions[r].data, rope_position.data(),
+                                   rope_position.size() * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream_for(r)));
+    }
+    mtp_forward_core_tp2(token, previous_hidden, position, rope_positions, envelope, mtp_hidden);
+    if (logits_column >= 0) {
+        auto logits_scope_0 = work_.scope();
+        auto logits_scope_1 = tp_->work->scope();
+        proposal_argmax_tp2(mtp_hidden, *logits, *draft_token);
+    }
+}
+
 void TextContext::proposal_argmax_tp2(const std::array<Tensor, 2>& hidden,
                                       const std::array<Tensor, 2>& logits,
                                       Tensor& proposal_tokens) {

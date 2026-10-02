@@ -350,6 +350,10 @@ private:
     // residual `x` is REPLICATED (bitwise identical on both ranks -- the reduce sums the same two
     // BF16 partials on both sides and IEEE addition is commutative), which is what keeps every
     // per-device GDN state and KV page in lockstep without any extra synchronization.
+public:
+    // The tp2 MTP bridge (schedule::mtp_bridge_and_propose) drives a TextContext from OUTSIDE the
+    // class, so the per-rank accessors it needs are public; the rank_* control-tensor mirrors below
+    // stay private because only the in-class forward paths use them.
     [[nodiscard]] bool tp2() const noexcept { return tp_ != nullptr; }
     [[nodiscard]] const ExecutionContext& ec() const;
     [[nodiscard]] std::array<WorkspaceArena*, 2> workspaces() const;
@@ -362,6 +366,7 @@ private:
     [[nodiscard]] LinearAttentionStatePool& state_for(int rank) const noexcept {
         return rank == 0 ? state_ : *tp_->state;
     }
+private:
     // Rank 1's own device copies of the per-call I32 control tensors. Rank 0 keeps using the
     // existing `active_*` bindings unchanged; these are their mirrors, set by the same call that
     // sets those. A null peer binding means "the same thing rank 0 has", which is only ever valid
@@ -416,6 +421,23 @@ private:
                               const std::array<Tensor, 2>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
                               const std::array<Tensor, 2>& mtp_hidden);
+    // tp2 twin of `mtp_forward_batch` (the MTP bridge / single-column MTP forward). `ids` is rank
+    // 0's token; each rank's stem takes its own retained target hidden (rank 0's fc shard
+    // contracts the normalized EMBEDDING half, rank 1's the normalized HIDDEN half), and the
+    // tail's cached attention appends AND reads the per-rank MTP KV shard at `positions` -- the
+    // same A1 semantics the tp1 bridge relies on, so the MTP KV frontier advances by one on both
+    // ranks in lockstep. `rope_position` is the caller's three-axis position, replicated to both
+    // ranks (RoPE angles are a function of position, not of rank). `logits_column >= 0` runs the
+    // vocabulary-split proposal argmax over the produced hidden; -1 skips it (ar_hidden only).
+    // Public because schedule::mtp_bridge_and_propose drives it from outside the class.
+public:
+    void mtp_forward_batch_tp2(const Tensor& token, const std::array<Tensor, 2>& previous_hidden,
+                               const std::array<Tensor, 2>& position,
+                               const std::array<std::int32_t, 3>& rope_position,
+                               ops::GqaExecutionEnvelope envelope,
+                               const std::array<Tensor, 2>& mtp_hidden, int logits_column,
+                               std::array<Tensor, 2>* logits, Tensor* draft_token);
+private:
     void mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                const std::array<Tensor, 2>& positions,
                                const std::array<Tensor, 2>& rope_positions,

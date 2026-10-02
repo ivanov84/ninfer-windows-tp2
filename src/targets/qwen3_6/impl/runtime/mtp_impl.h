@@ -116,20 +116,73 @@ TargetVerifyFrameView verify_view(const MtpRoundView& v, const GdnReplayRecords*
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
-                            const Tensor* next_embedding) {
+                            const Tensor* next_embedding, const Tensor* peer_previous_hidden) {
     if (!state.mtp_kv.valid() || !state.execution.io.mtp) {
         throw std::logic_error("MTP bridge requires MTP storage");
     }
-    if (state.execution.peer != nullptr) {
-        // Unreachable backstop, and deliberately kept as one. The bridge resumes the MTP head
-        // from a RETAINED target hidden, which lives only in rank 0's tail/checkpoint stores; the
-        // planner therefore downgrades every tp2 MTP prefix reuse to a full reset before a bridge
-        // can be staged (request_plan_impl.h). Throwing from inside prefill execution would take
-        // the executor down rather than fail one request, which is why the decision is made there.
-        throw std::logic_error("MTP bridge has no tensor-parallel path in this build");
-    }
     if (rope_position.size() != 3) {
         throw std::invalid_argument("MTP bridge requires one three-axis rope position");
+    }
+    if (state.execution.peer != nullptr) {
+        // tp2 bridge. The bridge resumes the MTP head from a RETAINED target hidden at the reuse
+        // frontier. That hidden is bit-identical on both ranks (final_norm is replicated and the
+        // target output is all-reduced), and each rank keeps its OWN copy: rank 0's in
+        // `previous_hidden` (the per-lane tail/checkpoint store) and rank 1's in
+        // `peer_previous_hidden` (PeerRuntime's mirror, kept in sync by copy_tail + the MTP decode
+        // round's accepted-hidden scatter). The MTP stem consumes them per rank -- rank 0's fc
+        // shard contracts the normalized EMBEDDING half, rank 1's the normalized HIDDEN half -- and
+        // the tail's cached attention appends AND reads each rank's own MTP KV shard at `position`,
+        // so the MTP KV frontier advances by one on both ranks in lockstep (the same A1 semantics
+        // the tp1 bridge relies on). No cross-rank transfer of the hidden is needed: each rank
+        // feeds its own row-parallel fc its own retained hidden.
+        if (build_proposal) {
+            // The AR proposal steps (drafts 1..extent-1) have no tp2 twin; the planner stages the
+            // tp2 bridge with build_proposal == false (the initial MTP draft comes from the staged
+            // prefill's final chunk, and the zero-suffix exact-hit case that would build a proposal
+            // here is downgraded to a full reset at tp2).
+            throw std::logic_error("tensor-parallel MTP bridge does not build an AR proposal");
+        }
+        if (peer_previous_hidden == nullptr) {
+            throw std::logic_error("tensor-parallel MTP bridge requires the peer's retained hidden");
+        }
+        std::optional<TpExecution> tp = tp_execution(state.execution);
+        if (!tp) {
+            throw std::logic_error("tensor-parallel MTP bridge has no peer execution");
+        }
+        // The per-sequence MTP KV window is request state, so rank 1's comes from the PrefillContext
+        // rather than the process-lifetime peer core -- exactly as the text prefill does.
+        tp->mtp_kv = state.mtp_kv_peer;
+        if (tp->mtp_kv.valid() != state.mtp_kv.valid()) {
+            throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+        }
+        state.execution.work.reset();
+        tp->work->reset();
+        TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                         state.execution.rope_frequency, state.text_kv,
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk,
+                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                         &*tp);
+        configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                            state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+        // The MTP KV row was bound once per sequence at bind_sequence_kv and persists for the whole
+        // request, so each rank's io.backend_kv_table_row already names this sequence's MTP page.
+        const ExecutionContext& bridge_ec = *tp->execution;
+        for_each_rank(bridge_ec, [&](int rank) {
+            Tensor position_view = card.io_for(rank).mtp->target_positions.slice(0, 0, 1);
+            ops::set_i32_scalar(position_view, position, card.stream_for(rank));
+        });
+        std::array<Tensor, 2> positions{state.execution.io.mtp->target_positions.slice(0, 0, 1),
+                                        state.execution.peer->io->mtp->target_positions.slice(0, 0, 1)};
+        std::array<Tensor, 2> previous{previous_hidden, *peer_previous_hidden};
+        std::array<Tensor, 2> mtp_hidden{state.execution.io.mtp->ar_hidden,
+                                         state.execution.peer->io->mtp->ar_hidden};
+        const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
+        const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
+        card.mtp_forward_batch_tp2(next_token, previous, positions,
+                                   {rope_position[0], rope_position[1], rope_position[2]},
+                                   bridge_envelope, mtp_hidden, -1, nullptr, nullptr);
+        return;
     }
     state.execution.work.reset();
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
@@ -284,7 +337,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                                        r.current_extents, r.verify_ids,
                                                        r.target_positions, ec.dev[rank]->stream);
             });
-            target_verify_accept(state.execution, state.continuation_hidden_store, card,
+            target_verify_accept(state.execution, state.continuation_hidden_store,
+                                 state.peer_continuation_hidden_store, card,
                                  verify_view(v, state.execution.replay_records),
                                  verify_view(p, tp->replay_records), envelopes.target_verify);
             for_each_rank(ec, [&](int rank) {

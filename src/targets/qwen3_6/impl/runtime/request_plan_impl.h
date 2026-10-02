@@ -242,18 +242,24 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
-    // MTP prefix reuse has no tensor-parallel implementation, for a reason narrower than the
-    // forward path: resuming a prefix runs the MTP BRIDGE, which drives the MTP head from the
-    // retained target hidden of the reused frontier. That hidden is a rank-0-only store
-    // (`tail_hidden_store` / `rewrite_checkpoint_hidden_store` live once, with all the other
-    // bookkeeping), and rank 1's MTP stem needs its own copy of it -- the stem's row-parallel fc
-    // contracts the normalized-HIDDEN half on device 1. Mirroring those two stores per lane is a
-    // separable change; until it lands, a tp2 MTP request that would resume instead re-prefills.
-    // The answer is identical, only the reuse saving is lost -- the same trade the zero-suffix
-    // downgrade above makes, and decided HERE for the same reason: a throw from inside prefill
-    // execution takes the whole executor down rather than failing one request.
+    // MTP prefix reuse at tp2 runs the MTP BRIDGE, which drives the MTP head from the retained
+    // target hidden of the reused frontier. Rank 1's MTP stem needs its OWN copy of that hidden
+    // -- the stem's row-parallel fc contracts the normalized-HIDDEN half on device 1 -- so the
+    // bridge consumes rank 0's per-lane store and the PeerRuntime mirror of it (kept in sync by
+    // copy_tail and the MTP decode round's accepted-hidden scatter). The bridge's MTP forward
+    // appends AND reads each rank's own MTP KV shard at the reuse frontier position (position-
+    // addressed, so it overwrites the slot the original request already wrote -- idempotent),
+    // which advances both ranks' MTP frontier in lockstep.
+    //
+    // The APPEND-AT-FRONTIER path is therefore fully supported at tp2 and no longer downgraded.
+    // The REWRITE-CHECKPOINT restores still are: their hidden lives in the rewrite-checkpoint
+    // store, which has no per-lane peer mirror yet, so a tp2 MTP request that would restore from
+    // a checkpoint re-prefills instead. The answer is identical, only the reuse saving is lost --
+    // the same trade the zero-suffix downgrade above makes, and decided HERE for the same reason:
+    // a throw from inside prefill execution takes the whole executor down rather than failing one
+    // request.
     if (tp != 1 && speculative_backend == SpeculativeBackend::Mtp &&
-        plan->reuse != ReusePath::FullReset) {
+        plan->reuse != ReusePath::FullReset && is_rewrite_checkpoint_restore(plan->reuse)) {
         plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
     }

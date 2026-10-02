@@ -155,8 +155,11 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
         composed_embedding = &visual_embedding;
     }
 
+    // tp2: multimodal prefix reuse is downgraded to a full reset at plan time, so the peer hidden
+    // is never needed here; pass nullptr (the tp2 branch of mtp_bridge_and_propose would throw if
+    // it were ever reached, which the planner prevents).
     mtp_bridge_and_propose(state, bridge_token, *bridge.previous_hidden, bridge.position,
-                           bridge.rope_position, false, composed_embedding);
+                           bridge.rope_position, false, composed_embedding, nullptr);
 }
 
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,

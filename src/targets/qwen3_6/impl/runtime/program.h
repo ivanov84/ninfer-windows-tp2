@@ -236,6 +236,14 @@ struct PeerRuntime {
     std::optional<GdnReplayRecords> replay_records;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
+    // Rank 1's OWN retained tail / rewrite-checkpoint hidden. `PeerRuntime` allocates a persistent
+    // arena with the SAME layout as rank 0's, so these regions already exist on the peer device --
+    // they were just never bound. The MTP decode round computes rank 1's accepted hidden locally
+    // (speculative_select_accepted_hidden) and the TP2 MTP bridge reads rank 1's stem through its
+    // row-parallel fc, so both ranks need their own copy; a single rank-0 buffer (or a broadcast of
+    // it) would feed rank 1's stem the wrong (rank-0) hidden. Bound in the PeerRuntime ctor.
+    Tensor tail_hidden;
+    Tensor rewrite_checkpoint_hidden;
     // Rank 1's OWN penalty counters. `ops::SamplingConfig::token_counts` is a raw device pointer,
     // and the MTP round's acceptance runs on both devices (see the replicated-accept note in
     // mtp_impl.h), so rank 1 must never be handed rank 0's. It is not a cache: rank 0 remains the

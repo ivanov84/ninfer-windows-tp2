@@ -35,8 +35,9 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 }
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope) {
+                          Tensor* peer_continuation_hidden_store, TextContext& card,
+                          TargetVerifyFrameView frame, TargetVerifyFrameView peer,
+                          ops::GqaExecutionEnvelope envelope) {
     if (execution.peer == nullptr) {
         throw std::logic_error("tensor-parallel target verify requires a peer");
     }
@@ -70,9 +71,16 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                               v.sampling, *work[r], stream);
         ops::speculative_select_accepted_hidden(v.target_hidden, v.accepted_drafts,
                                                 v.selected_hidden, stream);
+        // Each rank persists ITS OWN accepted hidden into ITS OWN per-lane store. Rank 0's store
+        // is `continuation_hidden_store`; rank 1's is `peer_continuation_hidden_store`. The next
+        // request's MTP bridge resumes each rank's stem from its own retained target hidden, so
+        // dropping rank 1's copy here would silently feed the bridge a stale/zero hidden.
+        if (rank == 0) {
+            ops::scatter(v.selected_hidden, v.lanes, continuation_hidden_store, stream);
+        } else if (peer_continuation_hidden_store != nullptr) {
+            ops::scatter(v.selected_hidden, v.lanes, *peer_continuation_hidden_store, stream);
+        }
     });
-    ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,
-                 execution.device.stream);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

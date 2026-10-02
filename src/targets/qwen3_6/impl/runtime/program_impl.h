@@ -235,6 +235,10 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
     io             = qwen3_6::RoundState(backing, plan.persistent.round);
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     token_counts   = plan.persistent.token_counts.bind(backing);
+    // Same layout as rank 0's arena (see the PeerRuntime::tail_hidden note): bind the peer's own
+    // retained-hidden regions so the TP2 MTP bridge and the decode commit can keep rank 1's copy.
+    tail_hidden               = plan.persistent.tail_hidden.bind(backing);
+    rewrite_checkpoint_hidden = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
 }
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
@@ -1742,9 +1746,18 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+        // The peer continuation store MUST be set here, not just in the real decode: this context is the
+        // one capture_graph() records into the CUDA graph, and run_prepared() LAUNCHES that graph
+        // (it does not re-run the body). rank 1's accepted-hidden scatter is therefore baked into
+        // the graph only if it runs during capture. Leaving it null (the default) would capture a
+        // graph that never scatters rank 1's hidden, so every real decode replay would leave the
+        // peer store stale and the next request's MTP bridge would feed rank 1's stem a wrong
+        // hidden. The scatter target is the same persistent arena the real decode uses
+        // (peer->tail_hidden), so capturing with it bound is safe and identical at replay time.
         schedule::MtpBatchContext mtp_state{
             execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
-            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
+            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store,
+            peer ? &peer->tail_hidden : nullptr};
         const GraphExecutionProfile code_warm = planned_profiles.front();
         prepare_representative(code_warm.min, 1);
         synchronize_all();
@@ -2055,6 +2068,28 @@ void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
                                cudaMemcpyDeviceToDevice, device.stream));
     sequence.tail_hidden_valid = true;
+    // tp2: mirror the retained target hidden to rank 1's own per-lane store so the next request's
+    // MTP bridge can resume rank 1's stem from its own copy. The value is the all-reduced final
+    // layer output plus the final norm (a per-element scale over the full, replicated hidden), so
+    // it is bit-identical on both ranks; copying rank 0's source across devices is therefore the
+    // correct rank-1 value. Without this, a request that ends at the prefill boundary or a rewrite
+    // checkpoint would leave rank 1's retained hidden stale, and the bridge would feed its
+    // row-parallel fc a wrong hidden -> silent MTP corruption.
+    //
+    // The copy reads rank 0's `source` on rank 1's stream, so rank 0's stream must have finished
+    // writing it first. `copy_tail` is only reached at prefill completion or a rewrite checkpoint
+    // (never the per-token MTP decode commit, which scatters each rank's own hidden same-device),
+    // so a single rank-0 stream sync here is off the hot path and negligible against prefill cost.
+    if (peer) {
+        device.synchronize();
+        // The peer store has the SAME [hidden, max_concurrency] layout as rank 0's, so write the
+        // per-lane column -- not the store base. `sequence.tail_hidden` is the per-lane slice of
+        // rank 0's store; a base write would land in lane 0 and the bridge would read the wrong
+        // (stale/zero) column for any lane > 0, feeding rank 1's stem a wrong hidden.
+        Tensor peer_lane = peer->tail_hidden.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
+        CUDA_CHECK(cudaMemcpyAsync(peer_lane.data, source.data, peer_lane.bytes(),
+                                   cudaMemcpyDeviceToDevice, peer->device.stream));
+    }
 }
 
 void ProgramImplCore::copy_round_token() {
@@ -2215,8 +2250,21 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 const TokenId token = staged.prompt.token_ids[staged.base];
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                            cudaMemcpyHostToDevice, device.stream));
+                // tp2: the bridge also needs rank 1's per-lane retained hidden (the PeerRuntime
+                // mirror of the same store). Only the AppendAtFrontier path reaches the tp2 MTP
+                // bridge (checkpoint restores are downgraded at plan time), so the mirror is the
+                // per-lane tail_hidden column. A named Tensor is required because slice() returns
+                // a view by value and the bridge takes a pointer to the store it reads.
+                Tensor peer_previous_view;
+                const Tensor* peer_previous = nullptr;
+                if (peer.has_value()) {
+                    peer_previous_view =
+                        peer->tail_hidden.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
+                    peer_previous = &peer_previous_view;
+                }
                 schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
-                                                 bridge.position, bridge.rope_position, false);
+                                                 bridge.position, bridge.rope_position, false,
+                                                 nullptr, peer_previous);
             }
             sequence.mtp_kv_valid = staged.base;
             staged.mtp_bridge     = MtpBridgeMode::None;
@@ -2289,10 +2337,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 mark_workspace_usage(workspace_plan.mtp_prefill);
                 const auto bridge_rope =
                     prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
+                // tp2: the zero-suffix exact-hit case is downgraded to a full reset at plan time, so the peer
+                // hidden is never needed here; pass nullptr (the tp2 branch of
+                // mtp_bridge_and_propose would throw if it were ever reached, which the planner
+                // prevents).
                 schedule::mtp_bridge_and_propose(
                     schedule_state, io.token, sequence.tail_hidden,
                     checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
-                    bridge_rope, staged.initial_mtp_extent != 0);
+                    bridge_rope, staged.initial_mtp_extent != 0, nullptr, nullptr);
                 sequence.mtp_kv_valid = staged.prompt_tokens;
                 staged.mtp_bridge     = MtpBridgeMode::None;
             }
@@ -2590,7 +2642,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 tail_hidden_store};
+                                                 tail_hidden_store,
+                                                 peer ? &peer->tail_hidden : nullptr};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),

@@ -160,6 +160,11 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Rank 1's own continuation-hidden store (the peer's per-lane tail-hidden arena). Null at tp1
+    // and for DFlash. At tp2 the MTP round scatters rank 1's accepted hidden here so the next
+    // request's MTP bridge can resume rank 1's stem from its own retained target hidden; without
+    // it the bridge would feed rank 1's row-parallel fc the wrong (rank-0) hidden.
+    Tensor* peer_continuation_hidden_store = nullptr;
 };
 
 struct DFlashBatchContext {
@@ -222,11 +227,15 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 // tp == 2 form. `peer` is rank 1's identically-shaped view of ITS OWN frame; the acceptance
 // arithmetic is replicated there rather than transferred, because every one of its inputs is
 // either the ingress record (copied to both frames) or the gathered logits (bit-identical on both
-// ranks). What is NOT replicated is rank 0's bookkeeping: the continuation-hidden scatter and the
-// egress transfer stay on rank 0 alone.
+// ranks). The continuation-hidden scatter is NOT replicated either: each rank scatters ITS OWN
+// accepted hidden into ITS OWN store (`continuation_hidden_store` on rank 0,
+// `peer_continuation_hidden_store` on rank 1), because the MTP bridge's rank-1 stem reads the
+// retained hidden from device 1. `peer_continuation_hidden_store` is null only in tests that do
+// not exercise the bridge.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope);
+                          Tensor* peer_continuation_hidden_store, TextContext& card,
+                          TargetVerifyFrameView frame, TargetVerifyFrameView peer,
+                          ops::GqaExecutionEnvelope envelope);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
@@ -249,7 +258,8 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
-                            const Tensor* next_embedding = nullptr);
+                            const Tensor* next_embedding = nullptr,
+                            const Tensor* peer_previous_hidden = nullptr);
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge);
 
