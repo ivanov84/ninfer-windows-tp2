@@ -320,12 +320,26 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                                   NumericFormat::FP32, {48});
             target.gdn.convolution = artifact::bind_device_tensor(
                 binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 10240});
-            target.gdn.control_projection = SplitGdnControlProjectionPlan{
-                .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
-                                            NumericFormat::BF16, {48, 5120}),
-                .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
-                                            NumericFormat::BF16, {48, 5120}),
-            };
+            // Two export forms of the same logical GDN control projections exist in the wild:
+            // the "nvfp4-split" export stores `gdn/a_projection` + `gdn/b_projection` as two
+            // [48, 5120] objects, while the "nvfp4full" export fuses them into one [96, 5120]
+            // `gdn/a_b_projection` object. Both are BF16 contiguous-le-v1 and reach the runtime
+            // through the split / fused GDN control projection paths (the fused path is the one
+            // the FP8 profile uses). The shapes are checked by the bind calls, so a mixed or
+            // corrupt export fails here rather than at graph-capture time.
+            if (binder.has_object(prefix + "gdn/a_b_projection")) {
+                target.gdn.control_projection = FusedGdnControlProjectionPlan{
+                    .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
+                                                  NumericFormat::BF16, {96, 5120}),
+                };
+            } else {
+                target.gdn.control_projection = SplitGdnControlProjectionPlan{
+                    .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
+                                                NumericFormat::BF16, {48, 5120}),
+                    .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
+                                                NumericFormat::BF16, {48, 5120}),
+                };
+            }
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
                     bind_nvfp4_weight(binder, prefix + "gdn/query_key_value_z", 16384, 5120,

@@ -1,47 +1,98 @@
 #!/usr/bin/env python3
 """
-Minimal prefix-reuse probe for ninfer-serve (TP2 + MTP).
+Prefix-reuse probe v2 for ninfer-serve (TP2 + MTP), JSONL-log based.
 
-OpenHands-independent: talks straight to http://localhost:8080/v1 (OpenAI-compatible),
-sends a large prompt, resends it, sends it with a small addition, then checks the
-SERVER LOG for cache=/reuse=/ttft= on each request.
+Why v2:
+  * The stdout log is block-buffered on Windows when redirected to a file, so
+    `[req N] done ...` lines are not visible while the server runs. The
+    structured request log (--request-log-jsonl) flushes after EVERY record,
+    so we parse that instead. Fields per request_done record:
+      result.prefix_cache_hit_tokens, result.prefix_reuse_path,
+      result.prompt_tokens, result.computed_prefill_tokens,
+      timings_seconds.{ttft,prefill,decode,total}, speculative.*
+  * An IDENTICAL resend of a finished request is a ZERO-SUFFIX reuse, which
+    tp2 intentionally downgrades to full_reset (the bonus token is sampled
+    through the vocab-split head, which has no tp2 path). So the expected
+    append_frontier case is a GROWING CONVERSATION: each request = previous
+    request's full prompt + previous answer + a new user turn. That is exactly
+    the history the fix enables (AppendAtFrontier with MTP bridge).
+  * The server must be started with --no-thinking so content is not empty
+    (a 64-token budget spent on reasoning_content hides the echoed fact).
+
+Request flow (single lane, max-concurrency 1):
+  R1: [system, user Q1]                          -> expect full_reset,  cache=0
+  R2: [system, user Q1, asst A1, user Q2]        -> expect append_frontier, cache>0
+  R3: R2 + [asst A2, user Q3]                    -> append_frontier, cache >= R2.cache
+  R4: R3 + [asst A3, user Q4] + tools + prompt_cache_key (OpenHands-style)
+                                          -> append_frontier (if schema accepts
+                                             the extras; 400 -> retry without them
+                                             and record a WARN)
 
 Usage:
-    python tmp\\cache_test.py [--base http://localhost:8080] [--key local]
-        [--log <path-to-ninfer-stderr.log>] [--ctx N] [--gen N] [--big N]
+    python cache_test.py --base http://localhost:8099 --key local --jsonl <path>
 
-Exit code 0 = all correctness assertions passed (reuse + cache as expected).
-The script prints a per-request table and a PASS/FAIL verdict.
+Exit 0 = all reuse/cache assertions passed.
 """
 import argparse
 import json
-import re
 import sys
 import time
 import urllib.request
 
-# ---- prompt material ---------------------------------------------------------
-# A stable, self-describing "system+history" block. Every request reuses it verbatim,
-# so a correct prefix cache must hit on it. We also embed a fact the model must echo
-# so we can sanity-check that generation is not garbage.
 FACT = "The secret code is KX-7741-DELTA."
-STABLE = (
-    "You are a precise assistant. " + FACT + " "
+STABLE_SYSTEM = (
+    "You are a precise assistant operating with a fixed toolset. " + FACT + " "
     "Answer the user's question in exactly one short line. "
     "First sentence of this block is a stable system prefix used by many requests.\n"
-    # pad to a few hundred tokens of stable context
     + ("Context line: the sky is clear and the lab is quiet. " * 60)
 )
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"}
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
 
-def build_prompt(addition: str) -> list:
-    return [
-        {"role": "system", "content": STABLE},
-        {"role": "user", "content": addition},
-    ]
+QUESTIONS = [
+    "What is the secret code?",
+    "What is the secret code, repeated twice?",
+    "Is the sky clear, and what is the secret code?",
+    "Give the secret code, then state whether the lab is quiet.",
+]
 
 
-def chat(base: str, key: str, messages: list, ctx: int, gen: int, timeout: int = 300):
+def read_done_rows(path: str):
+    """All request_done records (JSONL), in file order."""
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") == "request_done":
+                    rows.append(rec)
+    except OSError as exc:
+        print(f"  (could not read jsonl log {path}: {exc})")
+    return rows
+
+
+def chat(base: str, key: str, messages, gen: int, extra=None, timeout: int = 300):
     body = {
         "model": "qwen3.8-27b",
         "messages": messages,
@@ -49,130 +100,126 @@ def chat(base: str, key: str, messages: list, ctx: int, gen: int, timeout: int =
         "temperature": 0.0,
         "stream": False,
     }
-    if ctx:
-        body["max_context"] = ctx
+    if extra:
+        body.update(extra)
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         base.rstrip("/") + "/v1/chat/completions",
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + key,
-        },
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key},
         method="POST",
     )
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        status = resp.status
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        status = exc.code
     wall = time.perf_counter() - t0
     obj = json.loads(raw)
+    if "choices" not in obj:
+        return {
+            "status": status,
+            "wall_s": wall,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "finish": "http_error",
+            "content": json.dumps(obj)[:200],
+        }
+    choice = obj["choices"][0]
     usage = obj.get("usage", {})
-    content = obj["choices"][0]["message"]["content"]
-    finish = obj["choices"][0].get("finish_reason", "?")
     return {
         "status": status,
         "wall_s": wall,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
-        "finish": finish,
-        "content": content,
+        "finish": choice.get("finish_reason", "?"),
+        "content": choice["message"]["content"],
     }
-
-
-LOG_RE = re.compile(
-    r"\[req (?P<id>\d+)\] done finish=(?P<finish>\S+).*?prompt=(?P<prompt>\d+) "
-    r"gen=(?P<gen>\d+) cache=(?P<cache>\d+) reuse=(?P<reuse>\S+) "
-    r"ttft=(?P<ttft>\d+)ms prefill=(?P<prefill>[\d.]+) decode=(?P<decode>[\d.]+)"
-)
-
-
-def read_log(path: str):
-    if not path:
-        return []
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read().splitlines()
-    except OSError as exc:
-        print(f"  (could not read server log {path}: {exc})")
-        return []
-
-
-def last_req_entries(lines):
-    entries = []
-    for line in lines:
-        m = LOG_RE.search(line)
-        if m:
-            entries.append(m.groupdict())
-    return entries
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://localhost:8080")
+    ap.add_argument("--base", default="http://localhost:8099")
     ap.add_argument("--key", default="local")
-    ap.add_argument("--log", default="", help="path to the ninfer stderr log to parse")
-    ap.add_argument("--ctx", type=int, default=0, help="max_context (0 = server default)")
-    ap.add_argument("--gen", type=int, default=64, help="max_tokens per request")
-    ap.add_argument("--big", type=int, default=0, help="extra stable pad lines (0 = default ~300 tok)")
+    ap.add_argument("--jsonl", required=True,
+                    help="path to the server's --request-log-jsonl file")
+    ap.add_argument("--gen", type=int, default=64)
     args = ap.parse_args()
 
-    global STABLE
-    if args.big:
-        STABLE = STABLE + ("More stable context. " * args.big)
-
     rows = []
+    # conversation history grows across requests (the point of the test)
+    history = [{"role": "system", "content": STABLE_SYSTEM}]
 
-    def run(name, addition, expect_reuse, expect_cache_min):
-        before = last_req_entries(read_log(args.log))
-        t0 = time.perf_counter()
-        r = chat(args.base, args.key, build_prompt(addition), args.ctx, args.gen)
-        wall = time.perf_counter() - t0
-        after = last_req_entries(read_log(args.log))
-        # the new request is the last entry that is not in `before`
-        new = after[len(before):]
-        logrow = new[-1] if new else None
-        rows.append((name, r, wall, logrow, expect_reuse, expect_cache_min))
+    def run(name, question, expect_reuse, expect_cache_min, extra=None):
+        before = read_done_rows(args.jsonl)
+        r = chat(args.base, args.key, history, args.gen, extra=extra)
+        logrow = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            after = read_done_rows(args.jsonl)
+            if len(after) > len(before):
+                logrow = after[-1]
+                break
+            time.sleep(0.5)
+        rows.append((name, r, logrow, expect_reuse, expect_cache_min))
         print(f"\n=== {name} ===")
-        print(f"  client wall={wall:.2f}s status={r['status']} finish={r['finish']}")
+        print(f"  client wall={r['wall_s']:.2f}s status={r['status']} finish={r['finish']}")
         print(f"  usage prompt={r['prompt_tokens']} completion={r['completion_tokens']}")
         print(f"  content[:120]={r['content'][:120]!r}")
         if logrow:
+            res = logrow.get("result", {})
+            tim = logrow.get("timings_seconds", {})
             print(
-                f"  LOG  cache={logrow['cache']} reuse={logrow['reuse']} "
-                f"ttft={logrow['ttft']}ms prefill={logrow['prefill']} decode={logrow['decode']}"
+                f"  LOG  reuse={res.get('prefix_reuse_path')} "
+                f"cache={res.get('prefix_cache_hit_tokens')} "
+                f"prompt={res.get('prompt_tokens')} computed_prefill={res.get('computed_prefill_tokens')} "
+                f"ttft={tim.get('ttft', 0) * 1000:.0f}ms "
+                f"prefill_s={tim.get('prefill', 0):.3f} decode_s={tim.get('decode', 0):.3f}"
             )
         else:
-            print("  LOG  (no matching request-done line found in server log)")
+            print("  LOG  (no request_done record appeared in jsonl)")
 
-    # 1. cold: full prefill
-    run("1 cold (full prefill)", "What is the secret code?", "full_reset", 0)
-    # 2. identical resend: must reuse the stable prefix
-    run("2 identical resend", "What is the secret code?", "append_frontier", 1)
-    # 3. small addition: must reuse the stable prefix, compute only the new tail
-    run("3 +small addition", "What is the secret code? And is the sky clear?", "append_frontier", 1)
-    # 4. different question, same stable prefix: still reuses the prefix
-    run("4 different question", "Repeat only the secret code.", "append_frontier", 1)
+    # ---- R1: cold conversation turn ------------------------------------------
+    history.append({"role": "user", "content": QUESTIONS[0]})
+    run("R1 cold turn", QUESTIONS[0], "full_reset", 0)
 
-    # ---- verdict -------------------------------------------------------------
+    # ---- R2..R4: growing history (each turn appends the previous answer) -----
+    for idx in (1, 2, 3):
+        last = rows[-1]
+        history.append({"role": "assistant", "content": last[1]["content"]})
+        history.append({"role": "user", "content": QUESTIONS[idx]})
+        extras = None
+        if idx == 3:
+            # OpenHands-style extras: real tools + prompt_cache_key.
+            extras = {"tools": TOOLS, "prompt_cache_key": "openhands-session-42"}
+        run(f"R{idx + 1} growing history" + (" +OH-extras" if idx == 3 else ""),
+            QUESTIONS[idx], "append_frontier", 1, extra=extras)
+
+    # ---- verdict ---------------------------------------------------------------
     print("\n" + "=" * 70)
     print("VERDICT")
     print("=" * 70)
     ok = True
-    for name, r, wall, logrow, expect_reuse, expect_cache_min in rows:
+    for name, r, logrow, expect_reuse, expect_cache_min in rows:
         if logrow is None:
-            print(f"  {name}: FAIL (no server-log line)")
+            print(f"  {name}: FAIL (no log record)")
             ok = False
             continue
-        reuse_ok = logrow["reuse"] == expect_reuse
-        cache_ok = int(logrow["cache"]) >= expect_cache_min
-        line = f"  {name}: reuse={logrow['reuse']} (want {expect_reuse}) " \
-               f"cache={logrow['cache']} (want >={expect_cache_min}) -> "
+        res = logrow["result"]
+        reuse = res.get("prefix_reuse_path", "?")
+        cache = int(res.get("prefix_cache_hit_tokens", 0))
+        reuse_ok = reuse == expect_reuse
+        cache_ok = cache >= max(expect_cache_min, 0)
+        line = (f"  {name}: reuse={reuse} (want {expect_reuse}) "
+                f"cache={cache} (want >={expect_cache_min}) -> ")
         line += "PASS" if (reuse_ok and cache_ok) else "FAIL"
         print(line)
         ok = ok and reuse_ok and cache_ok
-    # correctness: the echoed fact must be present in at least the resend answers
-    for name, r, wall, logrow, _, _ in rows[1:]:
+    for name, r, logrow, _, _ in rows:
         if "KX-7741-DELTA" not in r["content"]:
             print(f"  {name}: WARN model did not echo the secret code -> {r['content'][:80]!r}")
     print("\nOVERALL:", "PASS" if ok else "FAIL")

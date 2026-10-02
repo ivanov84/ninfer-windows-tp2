@@ -84,6 +84,14 @@ public:
 
     void set_shard_resolver(ShardResolver resolver);
 
+    // Non-consuming existence probe: does the artifact name a stored object? A target uses this
+    // to pick between two interchangeable export forms of the same logical weight (e.g. a fused
+    // `gdn/a_b_projection` vs separate `gdn/a_projection` + `gdn/b_projection`) before committing
+    // to a binding. Unlike require_tensor it marks nothing consumed and allocates nothing.
+    [[nodiscard]] bool has_object(std::string_view name) const noexcept {
+        return reader_.find(name) != nullptr;
+    }
+
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);

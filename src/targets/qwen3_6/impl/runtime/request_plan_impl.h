@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -53,6 +55,25 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
     return prefill_units + decode_units;
+}
+
+// NINFER_DEBUG_REUSE=1: per-request trace of the prefix-reuse decision so a full_reset
+// can be attributed to the exact gate that produced it.
+bool reuse_debug_enabled() noexcept {
+    static const bool enabled =
+        std::getenv("NINFER_DEBUG_REUSE") != nullptr &&
+        std::strcmp(std::getenv("NINFER_DEBUG_REUSE"), "0") != 0;
+    return enabled;
+}
+
+const char* reuse_path_name(ReusePath path) noexcept {
+    switch (path) {
+    case ReusePath::FullReset: return "full_reset";
+    case ReusePath::AppendAtFrontier: return "append_frontier";
+    case ReusePath::RestoreTurnCheckpoint: return "restore_turn";
+    case ReusePath::RestoreResponseCheckpoint: return "restore_response";
+    }
+    return "?";
 }
 
 } // namespace
@@ -191,22 +212,74 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
+    const bool prefix_match_at_frontier =
+        sequence.execution_frontier != 0 &&
+        qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                        sequence.execution_frontier);
+    if (reuse_debug_enabled()) {
+        std::fprintf(stderr,
+                     "[reuse-debug] lane=%u prompt=%u exec_frontier=%u ledger_size=%zu "
+                     "allow_prefix_reuse=%d identity_reusable=%d retained=%d "
+                     "prefix_match_at_frontier=%d tail_hidden_valid=%d mtp_kv_valid=%u\n",
+                     lane, plan->summary.prompt_tokens, sequence.execution_frontier,
+                     sequence.ledger.size(), base.allow_prefix_reuse ? 1 : 0,
+                     prompt.identity.reusable ? 1 : 0, sequence.retained ? 1 : 0,
+                     prefix_match_at_frontier ? 1 : 0, sequence.tail_hidden_valid ? 1 : 0,
+                     sequence.mtp_kv_valid);
+        if (!prefix_match_at_frontier) {
+            const std::size_t frontier = sequence.execution_frontier;
+            const std::size_t n = std::min<std::size_t>(prompt.token_ids.size(), frontier);
+            std::size_t first_mismatch = n;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (prompt.token_ids[i] != sequence.ledger[i]) { first_mismatch = i; break; }
+            }
+            const bool token_ids_match = first_mismatch == n;
+            if (token_ids_match) {
+                std::fprintf(stderr, "[reuse-debug]   tokens MATCH for %zu; identity mismatch "
+                                     "(token_type/positions/vision)\n", n);
+            } else {
+                const std::size_t lo = first_mismatch > 4 ? first_mismatch - 4 : 0;
+                std::fprintf(stderr, "[reuse-debug]   FIRST TOKEN MISMATCH at i=%zu (frontier=%zu)\n",
+                             first_mismatch, frontier);
+                for (std::size_t i = lo; i < first_mismatch + 4 && i < n; ++i) {
+                    std::fprintf(stderr, "[reuse-debug]   i=%zu prompt=%lld ledger=%lld %s\n", i,
+                                 (long long)prompt.token_ids[i], (long long)sequence.ledger[i],
+                                 i == first_mismatch ? "<--" : "");
+                }
+            }
+        }
+        std::fflush(stderr);
+    }
+
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (sequence.execution_frontier != 0 && dflash_append_ready &&
-            qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier)) {
+        if (sequence.execution_frontier != 0 && dflash_append_ready && prefix_match_at_frontier) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = sequence.execution_frontier;
-        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
-                   sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.rewrite_checkpoint.frontier)) {
-            plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
-            plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+        } else {
+            const bool ckpt_valid     = sequence.rewrite_checkpoint.valid;
+            const bool ckpt_frontier  = sequence.rewrite_checkpoint.frontier != 0;
+            const bool ckpt_in_range  = sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size();
+            const bool ckpt_prefix_ok = ckpt_valid && ckpt_frontier && ckpt_in_range &&
+                qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                sequence.prefix_identity,
+                                                sequence.rewrite_checkpoint.frontier);
+            if (reuse_debug_enabled()) {
+                std::fprintf(stderr,
+                             "[reuse-debug] ckpt: valid=%d frontier=%u kind=%d in_range=%d "
+                             "prefix_ok=%d prompt_size=%zu ledger_size=%zu\n",
+                             ckpt_valid ? 1 : 0, sequence.rewrite_checkpoint.frontier,
+                             (int)sequence.rewrite_checkpoint.kind, ckpt_in_range ? 1 : 0,
+                             ckpt_prefix_ok ? 1 : 0, prompt.token_ids.size(),
+                             sequence.ledger.size());
+                std::fflush(stderr);
+            }
+            if (ckpt_prefix_ok) {
+                plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
+                plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+            }
         }
     }
 
@@ -251,18 +324,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // addressed, so it overwrites the slot the original request already wrote -- idempotent),
     // which advances both ranks' MTP frontier in lockstep.
     //
-    // The APPEND-AT-FRONTIER path is therefore fully supported at tp2 and no longer downgraded.
-    // The REWRITE-CHECKPOINT restores still are: their hidden lives in the rewrite-checkpoint
-    // store, which has no per-lane peer mirror yet, so a tp2 MTP request that would restore from
-    // a checkpoint re-prefills instead. The answer is identical, only the reuse saving is lost --
-    // the same trade the zero-suffix downgrade above makes, and decided HERE for the same reason:
-    // a throw from inside prefill execution takes the whole executor down rather than failing one
-    // request.
-    if (tp != 1 && speculative_backend == SpeculativeBackend::Mtp &&
-        plan->reuse != ReusePath::FullReset && is_rewrite_checkpoint_restore(plan->reuse)) {
-        plan->reuse      = ReusePath::FullReset;
-        plan->reuse_base = 0;
-    }
+    // The APPEND-AT-FRONTIER path is fully supported at tp2 and no longer downgraded.
+    // The REWRITE-CHECKPOINT restores are also supported at tp2 for the non-zero-suffix case:
+    // the rewrite-checkpoint hidden is only consumed by copy_tail when base == prompt_tokens
+    // (zero-suffix), which the zero-suffix downgrade above already catches. For the non-zero-
+    // suffix case the hidden is recomputed by the suffix prefill, so no peer mirror is needed.
+    // The GDN state is restored on both ranks via copy_slot (see program_impl.h restore path).
 
     // Multimodal prefix reuse has no tensor-parallel implementation either, and for two reasons.
     // (1) The vision PLANNER does not split the item control across the reuse boundary: every
@@ -355,6 +422,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
              : 0ULL);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
+    if (reuse_debug_enabled()) {
+        std::fprintf(stderr,
+                     "[reuse-debug] lane=%u FINAL reuse=%s reuse_base=%u prompt=%u "
+                     "prefix_match_at_frontier=%d tail_hidden_valid=%d mtp_kv_valid=%u\n",
+                     lane, reuse_path_name(plan->reuse), plan->reuse_base,
+                     plan->summary.prompt_tokens, prefix_match_at_frontier ? 1 : 0,
+                     sequence.tail_hidden_valid ? 1 : 0, sequence.mtp_kv_valid);
+        std::fflush(stderr);
+    }
     return RequestPlan(std::move(plan));
 }
 

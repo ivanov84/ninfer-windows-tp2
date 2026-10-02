@@ -102,6 +102,14 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-split") {
         return WeightsProfile::Qwen36Nvfp4;
     }
+    // The "nvfp4full" export carries the identical NVFP4 tensor schema as "nvfp4-split" with the
+    // sole difference that each layer's two GDN control projections are fused into one [96, 5120]
+    // `gdn/a_b_projection` object instead of separate [48, 5120] a/b objects. bind_nvfp4_text_layers
+    // selects the GDN control form from the artifact, so both export forms run the same Qwen36Nvfp4
+    // profile (W8G32 vocab planes, NVFP4 text layers).
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4full") {
+        return WeightsProfile::Qwen36Nvfp4;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }

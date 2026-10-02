@@ -746,6 +746,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
+            if (peer) {
+                const ScopedDevice peer_scope(peer->device.device);
+                peer->decoder->linear_attention.copy_slot(
+                    LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    peer->device.stream);
+            }
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
         } else {
@@ -2251,15 +2258,18 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                            cudaMemcpyHostToDevice, device.stream));
                 // tp2: the bridge also needs rank 1's per-lane retained hidden (the PeerRuntime
-                // mirror of the same store). Only the AppendAtFrontier path reaches the tp2 MTP
-                // bridge (checkpoint restores are downgraded at plan time), so the mirror is the
-                // per-lane tail_hidden column. A named Tensor is required because slice() returns
-                // a view by value and the bridge takes a pointer to the store it reads.
+                // mirror of the same store). The mirror is the per-lane column of the SAME store
+                // rank 0 reads: tail_hidden for AppendAtFrontier, rewrite_checkpoint_hidden for a
+                // checkpoint restore. A named Tensor is required because slice() returns a view by
+                // value and the bridge takes a pointer to the store it reads.
                 Tensor peer_previous_view;
                 const Tensor* peer_previous = nullptr;
                 if (peer.has_value()) {
+                    const Tensor& peer_store = is_rewrite_checkpoint_restore(staged.reuse)
+                                                    ? peer->rewrite_checkpoint_hidden
+                                                    : peer->tail_hidden;
                     peer_previous_view =
-                        peer->tail_hidden.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
+                        peer_store.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
                     peer_previous = &peer_previous_view;
                 }
                 schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
@@ -2407,6 +2417,19 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             sequence.rewrite_checkpoint = RewriteCheckpoint{
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
+            // tp2: mirror the rewrite-checkpoint hidden to rank 1's own per-lane store so the
+            // MTP bridge can resume rank 1's stem from its own copy. The value is the all-reduced
+            // final layer output plus the final norm (a per-element scale over the full,
+            // replicated hidden), so it is bit-identical on both ranks; copying rank 0's source
+            // across devices is the correct rank-1 value. Same pattern as copy_tail.
+            if (peer) {
+                device.synchronize();
+                Tensor peer_lane =
+                    peer->rewrite_checkpoint_hidden.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
+                CUDA_CHECK(cudaMemcpyAsync(peer_lane.data, sequence.rewrite_checkpoint_hidden.data,
+                                           peer_lane.bytes(), cudaMemcpyDeviceToDevice,
+                                           peer->device.stream));
+            }
         }
 
         staged.prompt.release_all_media_payloads();
